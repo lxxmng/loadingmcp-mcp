@@ -1,0 +1,34 @@
+{
+  "name": "@loadingmcp/mcp-server",
+  "mcpName": "io.github.lxxmng/container-loading",
+  "version": "0.1.0",
+  "description": "Container & truck load-planning MCP server — compute optimal 3D load plans, suggest a container mix, and list equipment with internal dimensions and payloads. Works with Claude, Cursor, and any MCP client.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": { "loadingmcp-mcp": "dist/index.js" },
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node",
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun src/index.ts"
+  },
+  "keywords": [
+    "load-planning",
+    "container-loading",
+    "bin-packing",
+    "freight",
+    "logistics",
+    "supply-chain",
+    "stuffing",
+    "mcp",
+    "model-context-protocol",
+    "claude"
+  ],
+  "author": "LoadingMCP",
+  "license": "MIT",
+  "homepage": "https://loadingmcp.com/mcp",
+  "repository": { "type": "git", "url": "https://github.com/lxxmng/loadingmcp-mcp" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.24.0"
+  }
+}
