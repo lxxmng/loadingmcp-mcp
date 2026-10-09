@@ -17,6 +17,8 @@ concurrency:
 jobs:
   publish:
     name: Publish
+    # Registry namespace belongs to the upstream owner; forks can't publish to it.
+    if: github.repository == 'lxxmng/loadingmcp-mcp'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

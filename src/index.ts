@@ -16,6 +16,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 import { z } from 'zod'
+import pkg from '../package.json'
 
 const PORT = Number.parseInt(process.env.MCP_PORT ?? '3002')
 const DEMO_KEY = process.env.MCP_DEMO_API_KEY ?? 'lmcp_demo_public'
@@ -107,15 +108,83 @@ const DEMO_EQUIPMENT: Array<{
   },
 ]
 
+/** Practical packing efficiency assumed by every demo estimate (plan_load, suggest_containers). */
+const PACKING_EFFICIENCY = 0.85
+
+type DemoEquipment = (typeof DEMO_EQUIPMENT)[number]
+
+/** Internal volume in m³, derived from the internal dimensions (e.g. 40HC → 76.35). */
+function internalVolumeM3(e: DemoEquipment) {
+  return (e.innerLengthMm * e.innerWidthMm * e.innerHeightMm) / 1_000_000_000
+}
+
+const round1 = (n: number) => Math.round(n * 10) / 10
+const round2 = (n: number) => Math.round(n * 100) / 100
+
+/** True if the item fits inside the equipment in some axis-aligned orientation. */
+function itemFits(
+  item: { length: number; width: number; height: number },
+  e: DemoEquipment
+) {
+  const a = [item.length, item.width, item.height].sort((x, y) => x - y)
+  const b = [e.innerLengthMm, e.innerWidthMm, e.innerHeightMm].sort((x, y) => x - y)
+  return a.every((d, i) => d <= b[i])
+}
+
+/** How many units of `e` are needed for the given cargo totals, and what limits it. */
+function unitsNeeded(e: DemoEquipment, volumeM3: number, weightKg: number) {
+  const byVolume = Math.max(Math.ceil(volumeM3 / (internalVolumeM3(e) * PACKING_EFFICIENCY)), 1)
+  const byWeight = Math.max(Math.ceil(weightKg / e.maxPayloadKg), 1)
+  return {
+    count: Math.max(byVolume, byWeight),
+    limitedBy: byWeight > byVolume ? ('weight' as const) : ('volume' as const),
+  }
+}
+
+/** Auto right-size: fewest units, then smallest total capacity. Null if nothing in the pool fits. */
+function rightSize(
+  pool: DemoEquipment[],
+  items: Array<{ length: number; width: number; height: number }>,
+  volumeM3: number,
+  weightKg: number
+) {
+  const candidates = pool
+    .filter((e) => items.every((i) => itemFits(i, e)))
+    .map((e) => ({ e, ...unitsNeeded(e, volumeM3, weightKg) }))
+    .sort(
+      (x, y) =>
+        x.count - y.count || x.count * internalVolumeM3(x.e) - y.count * internalVolumeM3(y.e)
+    )
+  return candidates[0]?.e ?? null
+}
+
 function listDemoEquipment(category?: 'container' | 'truck' | 'uld' | 'pallet') {
   return category ? DEMO_EQUIPMENT.filter((e) => e.category === category) : DEMO_EQUIPMENT
+}
+
+async function parseApiResponse(res: Response) {
+  const text = await res.text()
+  let body: unknown
+  try {
+    body = text ? JSON.parse(text) : null
+  } catch {
+    body = { raw: text.slice(0, 500) }
+  }
+  if (!res.ok) {
+    const detail =
+      body && typeof body === 'object' && 'error' in body
+        ? JSON.stringify((body as { error: unknown }).error)
+        : text.slice(0, 200)
+    throw new Error(`LoadingMCP API ${res.status}${detail ? `: ${detail}` : ''}`)
+  }
+  return body
 }
 
 async function apiGet(path: string, apiKey: string) {
   const res = await fetch(`${API_URL}${path}`, {
     headers: { Authorization: `Bearer ${apiKey}` },
   })
-  return res.json()
+  return parseApiResponse(res)
 }
 
 async function apiPost(path: string, apiKey: string, body: unknown) {
@@ -124,12 +193,26 @@ async function apiPost(path: string, apiKey: string, body: unknown) {
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify(body),
   })
-  return res.json()
+  return parseApiResponse(res)
 }
 
 /** Wrap a JSON value as an MCP text result. */
 function textResult(obj: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(obj, null, 2) }] }
+}
+
+/** Wrap a failure as an MCP tool error so clients see it instead of a bogus result. */
+function errorResult(obj: unknown) {
+  return { ...textResult(obj), isError: true as const }
+}
+
+/** Run an upstream API call, turning failures into MCP tool errors. */
+async function viaApi(call: () => Promise<unknown>) {
+  try {
+    return textResult(await call())
+  } catch (err) {
+    return errorResult({ error: 'upstream_error', message: (err as Error).message })
+  }
 }
 
 // Shared cargo-item schema for plan_load / export_plan.
@@ -170,7 +253,7 @@ const cargoItemSchema = z.object({
 
 function buildServer(apiKey: string) {
   const isDemo = apiKey === DEMO_KEY
-  const server = new McpServer({ name: 'container-loading', version: '0.1.0' })
+  const server = new McpServer({ name: 'container-loading', version: pkg.version })
 
   server.tool(
     'list_equipment',
@@ -189,8 +272,7 @@ function buildServer(apiKey: string) {
         })
       }
       const query = category ? `?category=${category}` : ''
-      const data = await apiGet(`/v1/equipment${query}`, apiKey)
-      return textResult(data)
+      return viaApi(() => apiGet(`/v1/equipment${query}`, apiKey))
     }
   )
 
@@ -203,18 +285,21 @@ function buildServer(apiKey: string) {
     },
     async ({ volumeM3, weightKg }) => {
       if (isDemo) {
-        // 40HC ≈ 76.3 m³ usable, 26.46 t payload.
-        const byVolume = Math.ceil(volumeM3 / 76.3)
-        const byWeight = Math.ceil(weightKg / 26460)
-        const count = Math.max(byVolume, byWeight, 1)
+        const hc = DEMO_EQUIPMENT.find((e) => e.code === '40HC')!
+        const { count, limitedBy } = unitsNeeded(hc, volumeM3, weightKg)
         return textResult({
-          suggestion: `${count} x 40HC`,
-          limited_by: byWeight > byVolume ? 'weight' : 'volume',
+          suggestion: `${count} x ${hc.code}`,
+          limited_by: limitedBy,
+          basis: {
+            internalVolumePerUnitM3: round2(internalVolumeM3(hc)),
+            usableVolumePerUnitM3: round2(internalVolumeM3(hc) * PACKING_EFFICIENCY),
+            packingEfficiency: PACKING_EFFICIENCY,
+            maxPayloadKg: hc.maxPayloadKg,
+          },
           note: 'Quick volume/weight estimate (synthetic demo) — call plan_load for an exact dimension-aware plan.',
         })
       }
-      const data = await apiPost('/v1/suggest', apiKey, { volumeM3, weightKg })
-      return textResult(data)
+      return viaApi(() => apiPost('/v1/suggest', apiKey, { volumeM3, weightKg }))
     }
   )
 
@@ -258,12 +343,13 @@ function buildServer(apiKey: string) {
     },
     async ({ equipmentCode, mode, items, vgm }) => {
       if (!isDemo) {
-        const data = await apiPost('/v1/plan', apiKey, {
-          ...(equipmentCode ? { equipmentCode } : { mode }),
-          items,
-          ...(vgm ? { options: { vgm } } : {}),
-        })
-        return textResult(data)
+        return viaApi(() =>
+          apiPost('/v1/plan', apiKey, {
+            ...(equipmentCode ? { equipmentCode } : { mode }),
+            items,
+            ...(vgm ? { options: { vgm } } : {}),
+          })
+        )
       }
 
       // ── Demo: synthetic dimension-aware plan ────────────────────────────────
@@ -276,27 +362,40 @@ function buildServer(apiKey: string) {
       const totalWeightKg = items.reduce((w, i) => w + i.weight * i.quantity, 0)
       const needsReefer = items.some((i) => i.refrigerated)
 
-      // Pick a plausible equipment: explicit, else cheapest by mode that "fits" by volume.
+      // Equipment: explicit code, else the smallest option in the mode's pool that fits the cargo.
       const pool = listDemoEquipment(
         mode === 'road' ? 'truck' : mode === 'air' ? 'uld' : 'container'
       )
-      let chosen = equipmentCode
+      const chosen = equipmentCode
         ? DEMO_EQUIPMENT.find((e) => e.code === equipmentCode.toUpperCase())
-        : pool[0]
-      if (equipmentCode && !chosen) return textResult({ error: 'unknown_equipment', equipmentCode })
-      if (!chosen) chosen = pool[0] ?? DEMO_EQUIPMENT[0]
+        : rightSize(pool, items, totalVolumeM3, totalWeightKg)
+      if (equipmentCode && !chosen) return errorResult({ error: 'unknown_equipment', equipmentCode })
+      if (!chosen) {
+        return errorResult({
+          error: 'no_fitting_equipment',
+          message: `No demo ${mode} equipment can hold the largest cargo item; try a different mode or a real API key for the full catalogue.`,
+        })
+      }
+      const oversized = items.filter((i) => !itemFits(i, chosen)).map((i) => i.id)
+      if (oversized.length) {
+        return errorResult({
+          error: 'item_exceeds_equipment',
+          equipmentCode: chosen.code,
+          itemIds: oversized,
+          message: 'These items are larger than the equipment interior in every orientation.',
+        })
+      }
 
-      const usableVolM3 =
-        (chosen.innerLengthMm * chosen.innerWidthMm * chosen.innerHeightMm) / 1_000_000_000
-      // Assume ~85% practical packing efficiency for the synthetic estimate.
-      const byVolume = Math.ceil(totalVolumeM3 / (usableVolM3 * 0.85)) || 1
-      const byWeight = Math.ceil(totalWeightKg / chosen.maxPayloadKg) || 1
-      const containersUsed = Math.max(byVolume, byWeight, 1)
+      const usableVolM3 = internalVolumeM3(chosen)
+      const { count: containersUsed, limitedBy } = unitsNeeded(
+        chosen,
+        totalVolumeM3,
+        totalWeightKg
+      )
 
-      const volumeUtilPct =
-        Math.round((totalVolumeM3 / (usableVolM3 * containersUsed)) * 1000) / 10
-      const payloadUtilPct =
-        Math.round((totalWeightKg / (chosen.maxPayloadKg * containersUsed)) * 1000) / 10
+      // Utilization is against the full internal volume / payload of the units used.
+      const volumeUtilPct = round1((totalVolumeM3 / (usableVolM3 * containersUsed)) * 100)
+      const payloadUtilPct = round1((totalWeightKg / (chosen.maxPayloadKg * containersUsed)) * 100)
 
       const securing: Array<{ level: string; action: string; detail: string }> = []
       if (items.some((i) => i.type === 'drum' || i.type === 'cylinder' || i.type === 'roll')) {
@@ -325,13 +424,14 @@ function buildServer(apiKey: string) {
         engine: 'offline-preview',
         containersUsed,
         placedUnits: totalUnits,
-        limitedBy: byWeight > byVolume ? 'weight' : 'volume',
+        limitedBy,
         reeferUsed: needsReefer,
         metrics: {
           volumeUtilPct,
           payloadUtilPct,
           usedWeightKg: totalWeightKg,
-          usedVolumeM3: Math.round(totalVolumeM3 * 100) / 100,
+          usedVolumeM3: round2(totalVolumeM3),
+          internalVolumePerUnitM3: round2(usableVolM3),
           // Synthetic centre-of-gravity offset from geometric centre (%), well within tolerance.
           cogOffsetPct: { x: 3, y: 2 },
           crushViolations: 0,
@@ -385,25 +485,36 @@ function buildServer(apiKey: string) {
     },
     async ({ equipmentCode, mode, retailers, items }) => {
       if (!isDemo) {
-        const data = await apiPost('/v1/export', apiKey, {
-          ...(equipmentCode ? { equipmentCode } : { mode }),
-          ...(retailers ? { retailers } : {}),
-          items,
-        })
-        return textResult(data)
+        return viaApi(() =>
+          apiPost('/v1/export', apiKey, {
+            ...(equipmentCode ? { equipmentCode } : { mode }),
+            ...(retailers ? { retailers } : {}),
+            items,
+          })
+        )
       }
 
       // ── Demo: synthetic loading work order ──────────────────────────────────
       const pool = listDemoEquipment(
         mode === 'road' ? 'truck' : mode === 'air' ? 'uld' : 'container'
       )
-      let chosen = equipmentCode
-        ? DEMO_EQUIPMENT.find((e) => e.code === equipmentCode.toUpperCase())
-        : pool[0]
-      if (equipmentCode && !chosen) return textResult({ error: 'unknown_equipment', equipmentCode })
-      if (!chosen) chosen = pool[0] ?? DEMO_EQUIPMENT[0]
-
+      const totalVolumeM3 = items.reduce(
+        (v, i) => v + (i.length * i.width * i.height * i.quantity) / 1_000_000_000,
+        0
+      )
       const totalWeightKg = items.reduce((w, i) => w + i.weight * i.quantity, 0)
+      const chosen = equipmentCode
+        ? DEMO_EQUIPMENT.find((e) => e.code === equipmentCode.toUpperCase())
+        : rightSize(pool, items, totalVolumeM3, totalWeightKg)
+      if (equipmentCode && !chosen) return errorResult({ error: 'unknown_equipment', equipmentCode })
+      if (!chosen) {
+        return errorResult({
+          error: 'no_fitting_equipment',
+          message: `No demo ${mode} equipment can hold the largest cargo item; try a different mode or a real API key for the full catalogue.`,
+        })
+      }
+      const unitsUsed = unitsNeeded(chosen, totalVolumeM3, totalWeightKg).count
+
       // Heaviest / non-stackable first (floor), lightest / soft last (top).
       const rank = (t: string) =>
         t === 'bigbag' || t === 'sack' ? 2 : t === 'pallet' || t === 'box' ? 1 : 0
@@ -452,13 +563,14 @@ function buildServer(apiKey: string) {
           equipmentCode: chosen.code,
           equipmentName: chosen.name,
           autoSized: !equipmentCode,
+          unitsRequired: unitsUsed,
           stuffingSequence,
           securingActions,
           declarations: {
             vgm: {
-              estimatedKg: totalWeightKg + tareKg,
+              estimatedKg: totalWeightKg + tareKg * unitsUsed,
               method: 'M2-estimate',
-              note: 'Calculated cargo + representative tare — declare your own weighbridge/certified VGM.',
+              note: 'Calculated cargo + representative tare (summed over all units) — declare your own weighbridge/certified VGM.',
             },
             axleLoadNote:
               chosen.category === 'truck'
@@ -485,10 +597,18 @@ const handler = async (req: Request): Promise<Response> => {
   const authHeader = req.headers.get('Authorization')
   const apiKey = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : DEMO_KEY
 
-  const server = buildServer(apiKey)
-  const transport = new WebStandardStreamableHTTPServerTransport()
-  await server.connect(transport)
-  return transport.handleRequest(req)
+  try {
+    const server = buildServer(apiKey)
+    const transport = new WebStandardStreamableHTTPServerTransport()
+    await server.connect(transport)
+    return await transport.handleRequest(req)
+  } catch (err) {
+    console.error('mcp request failed', err)
+    return new Response(JSON.stringify({ error: 'internal_error' }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
 }
 
 Bun.serve({ port: PORT, fetch: handler })
