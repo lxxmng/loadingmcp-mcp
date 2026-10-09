@@ -17,6 +17,15 @@ Ask your AI: *"Plan a 40HC load for these pallets"* or *"What's the cheapest con
 
 Sister product to [TrackingMCP](https://trackingmcp.com) (ocean container tracking) and [SchedulesMCP](https://schedulesmcp.com) (sailing schedules & reliability).
 
+## Run your own copy (forks)
+
+The hosted `mcp.loadingmcp.com` belongs to the upstream project, so a fork has to run its own server. The demo key needs no upstream API, so everything below works out of the box.
+
+- **Quick test, no account:** Actions tab -> **Test run** -> *Run workflow*. It starts the server, smoke-tests it and prints a temporary `https://<random>.trycloudflare.com/mcp` URL in the log (open for 20 min by default). Use it with `Authorization: Bearer lmcp_demo_public`.
+- **Permanent hosting (Fly.io):** `fly apps create <unique-name>`, then add repo secret `FLY_API_TOKEN` (`fly tokens create deploy -a <unique-name>`) and repo variable `FLY_APP=<unique-name>`. The **Deploy** workflow then ships every push to `main` to `https://<unique-name>.fly.dev/mcp`.
+- **Locally:** `bun install && bun start`, then `scripts/smoke.sh`.
+- Real API keys call `LOADINGMCP_API_URL` (default `https://loadingmcp-api.fly.dev`); override it with that env var if you run your own backend.
+
 ## Tools
 
 | Tool | What it does |

@@ -1,0 +1,54 @@
+name: Test run (temporary public URL)
+
+# Starts the server on a GitHub runner, smoke-tests it, and exposes it through a free Cloudflare
+# quick tunnel so you can point Claude / Cursor at it for a while. No account or secrets needed.
+# The URL is printed in the job log and disappears when the job ends (default 20 min, max 120).
+# Run it from the Actions tab -> "Test run" -> "Run workflow".
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: How long to keep the tunnel open (1-120)
+        default: '20'
+
+permissions:
+  contents: read
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 130
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+
+      - name: Start server
+        run: |
+          MCP_PORT=3002 bun src/index.ts > server.log 2>&1 &
+          sleep 3
+          scripts/smoke.sh http://localhost:3002
+
+      - name: Open tunnel
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          case "$MINUTES" in ''|*[!0-9]*) MINUTES=20 ;; esac
+          [ "$MINUTES" -gt 120 ] && MINUTES=120
+          [ "$MINUTES" -lt 1 ] && MINUTES=1
+          curl -fsSL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          ./cloudflared tunnel --no-autoupdate --url http://localhost:3002 > tunnel.log 2>&1 &
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          [ -n "${URL:-}" ] || { cat tunnel.log; echo "::error::tunnel did not start"; exit 1; }
+          {
+            echo "### MCP endpoint (live for $MINUTES min)"
+            echo "\`$URL/mcp\` - use header \`Authorization: Bearer lmcp_demo_public\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=MCP URL::$URL/mcp"
+          sleep $((MINUTES * 60))

@@ -1,8 +1,12 @@
 name: Deploy
 
-# Deploys the hosted MCP server to Fly.io (app + region in fly.toml) on every push to main,
-# after a smoke test of /health. Requires the repo secret FLY_API_TOKEN
-# (create with: fly tokens create deploy -a loadingmcp-mcp).
+# Deploys your own copy of the server to Fly.io. Manual by default so a fresh fork never fails;
+# once FLY_API_TOKEN is set, pushes to main deploy automatically.
+#
+# One-time setup (see README "Run your own copy"):
+#   1. fly apps create <your-unique-app-name>
+#   2. fly tokens create deploy -a <your-unique-app-name>   -> repo secret FLY_API_TOKEN
+#   3. repo variable FLY_APP = <your-unique-app-name>
 on:
   push:
     branches: [main]
@@ -19,18 +23,35 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      FLY_APP: ${{ vars.FLY_APP }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Deploy
-        run: flyctl deploy --remote-only
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-      - name: Smoke test
+      - name: Check configuration
+        id: cfg
         run: |
-          for i in 1 2 3 4 5; do
-            curl -fsS https://mcp.loadingmcp.com/health && exit 0
+          if [ -z "$FLY_API_TOKEN" ] || [ -z "$FLY_APP" ]; then
+            echo "::notice::FLY_API_TOKEN secret and/or FLY_APP variable not set - skipping deploy."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.cfg.outputs.ready == 'true'
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+        if: steps.cfg.outputs.ready == 'true'
+
+      - name: Deploy
+        if: steps.cfg.outputs.ready == 'true'
+        run: flyctl deploy --remote-only --app "$FLY_APP"
+
+      - name: Smoke test deployed app
+        if: steps.cfg.outputs.ready == 'true'
+        run: |
+          for i in 1 2 3 4 5 6; do
+            scripts/smoke.sh "https://${FLY_APP}.fly.dev" && exit 0
             sleep 10
           done
-          echo "::error::health check failed after deploy"
+          echo "::error::smoke test failed after deploy"
           exit 1

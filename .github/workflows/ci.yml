@@ -24,6 +24,12 @@ jobs:
       - name: Build
         run: bun run build
 
+      - name: Smoke test (demo key, no upstream needed)
+        run: |
+          MCP_PORT=3002 bun src/index.ts &
+          sleep 3
+          scripts/smoke.sh http://localhost:3002
+
       - name: Manifests are valid JSON
         run: |
           for f in package.json server.json glama.json; do
